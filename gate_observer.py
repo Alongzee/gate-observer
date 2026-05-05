@@ -1,10 +1,10 @@
 """
-gate_observer.py — FIXED v2
-Uses gate_ws SDK with explicit pair list.
+gate_observer.py — FIXED v3
+Gate.io Spot Observer — USDT → Any indirect conversion scanner.
+Subscribes to USDT pairs only. SDK callback fixed.
 """
 
 import asyncio
-import json
 import logging
 import os
 import sqlite3
@@ -93,16 +93,20 @@ async def fetch_all_pairs() -> List[str]:
 # ─── WEBSOCKET CALLBACK ──────────────────────────────────────────────────
 def on_ticker(conn: Connection, response: WebSocketResponse):
     if response.error:
-        log.error(f"WS error: {response.error}")
         return
     result = response.result
+    # Handle both list and dict formats
+    items = []
     if isinstance(result, list):
-        for ticker in result:
-            symbol = ticker.get("currency_pair", "")
-            bid = float(ticker.get("highest_bid", 0))
-            ask = float(ticker.get("lowest_ask", 0))
-            if symbol and bid > 0 and ask > 0:
-                update_price(symbol, bid, ask)
+        items = result
+    elif isinstance(result, dict):
+        items = [result]
+    for ticker in items:
+        symbol = ticker.get("currency_pair", "")
+        bid = float(ticker.get("highest_bid", 0))
+        ask = float(ticker.get("lowest_ask", 0))
+        if symbol and bid > 0 and ask > 0:
+            update_price(symbol, bid, ask)
 
 # ─── ENGINE ──────────────────────────────────────────────────────────────
 def build_matrix():
@@ -191,24 +195,22 @@ async def scan_loop(conn_db):
 # ─── MAIN ────────────────────────────────────────────────────────────────
 async def main():
     log.info("=" * 55)
-    log.info("  GATE.IO OBSERVER — Phase 1 (SDK v2)")
+    log.info("  GATE.IO OBSERVER — Phase 1 (SDK v3)")
     log.info(f"  Fee: {TAKER_FEE*100:.2f}% per leg ({TAKER_FEE*2*100:.2f}% cycle)")
     log.info("=" * 55)
 
-    # Fetch all pairs first
     all_pairs = await fetch_all_pairs()
     if not all_pairs:
         log.error("No pairs fetched. Exiting.")
         return
 
-    # Initialize SDK connection
+    usdt_pairs = [p for p in all_pairs if p.endswith("_USDT")]
+    log.info(f"Subscribing to {min(len(usdt_pairs), 100)} USDT pairs")
+
     conn = Connection(Configuration())
     channel = SpotTickerChannel(conn, on_ticker)
-    channel.subscribe(all_pairs[:200])  # Max 200 pairs per subscription
+    channel.subscribe(usdt_pairs[:100])
 
-    log.info(f"Subscribed to {min(len(all_pairs), 200)} pairs")
-
-    # Run WebSocket and scanner
     await asyncio.gather(
         conn.run(),
         scan_loop(init_db()),
