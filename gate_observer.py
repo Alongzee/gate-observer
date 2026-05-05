@@ -1,9 +1,10 @@
 """
-gate_observer.py — FIXED with official Gate.io SDK
-Uses gate_ws library for proper WebSocket connection.
+gate_observer.py — FIXED v2
+Uses gate_ws SDK with explicit pair list.
 """
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -11,18 +12,18 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import httpx
 from gate_ws import Configuration, Connection, WebSocketResponse
 from gate_ws.spot import SpotTickerChannel
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────
 DB_PATH = os.path.expanduser("~/gate-observer/gate_gaps.db")
-TAKER_FEE = 0.0009  # 0.09% Gate.io spot taker
+TAKER_FEE = 0.0009
 PRICE_STALE_SEC = 3.0
 SCAN_INTERVAL = 0.05
 
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDD", "FRAX", "USDP", "PYUSD"}
 
-# ─── LOGGING ─────────────────────────────────────────────────────────────
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("gate_observer")
 
@@ -72,11 +73,27 @@ def log_scan(conn, direction, intermediary, target, net_spread, gross_spread, di
     )
     conn.commit()
 
+# ─── FETCH ALL SPOT PAIRS ────────────────────────────────────────────────
+async def fetch_all_pairs() -> List[str]:
+    """Fetch all spot trading pairs from Gate.io REST API."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get("https://api.gateio.ws/api/v4/spot/currency_pairs")
+        data = resp.json()
+    pairs = []
+    for item in data:
+        if item.get("trade_status") == "tradable":
+            pair_id = item.get("id", "")
+            if "_" in pair_id:
+                base, quote = pair_id.split("_", 1)
+                if base not in STABLECOINS or quote not in STABLECOINS:
+                    pairs.append(pair_id)
+    log.info(f"Fetched {len(pairs)} tradable spot pairs")
+    return pairs
+
 # ─── WEBSOCKET CALLBACK ──────────────────────────────────────────────────
 def on_ticker(conn: Connection, response: WebSocketResponse):
-    """Callback for each ticker update."""
     if response.error:
-        log.error(f"WebSocket error: {response.error}")
+        log.error(f"WS error: {response.error}")
         return
     result = response.result
     if isinstance(result, list):
@@ -86,22 +103,12 @@ def on_ticker(conn: Connection, response: WebSocketResponse):
             ask = float(ticker.get("lowest_ask", 0))
             if symbol and bid > 0 and ask > 0:
                 update_price(symbol, bid, ask)
-    elif isinstance(result, dict):
-        symbol = result.get("currency_pair", "")
-        bid = float(result.get("highest_bid", 0))
-        ask = float(result.get("lowest_ask", 0))
-        if symbol and bid > 0 and ask > 0:
-            update_price(symbol, bid, ask)
 
-# ─── ENGINE FUNCTIONS ────────────────────────────────────────────────────
+# ─── ENGINE ──────────────────────────────────────────────────────────────
 def build_matrix():
-    """Build intermediaries and targets from live price book."""
     intermediaries = []
     targets = {}
     for sym in list(prices.keys()):
-        entry = get_price(sym)
-        if entry is None:
-            continue
         parts = sym.split("_")
         if len(parts) != 2:
             continue
@@ -125,7 +132,6 @@ def build_matrix():
     return intermediaries, targets
 
 def evaluate_route(intermediary: str, target: str) -> Optional[Dict]:
-    """USDT → intermediary → target vs USDT → target directly."""
     x_usdt = get_price(f"{intermediary}_USDT")
     x_target = get_price(f"{intermediary}_{target}")
     target_usdt = get_price(f"{target}_USDT")
@@ -155,7 +161,7 @@ def evaluate_route(intermediary: str, target: str) -> Optional[Dict]:
 
 # ─── SCAN LOOP ───────────────────────────────────────────────────────────
 async def scan_loop(conn_db):
-    log.info("Gate.io observer started — scanning USDT → Any indirect routes")
+    log.info("Scanning USDT → Any indirect routes")
     scan_count = 0
     positive_count = 0
     last_heartbeat = time.time()
@@ -185,24 +191,26 @@ async def scan_loop(conn_db):
 # ─── MAIN ────────────────────────────────────────────────────────────────
 async def main():
     log.info("=" * 55)
-    log.info("  GATE.IO OBSERVER — Phase 1 (Official SDK)")
+    log.info("  GATE.IO OBSERVER — Phase 1 (SDK v2)")
     log.info(f"  Fee: {TAKER_FEE*100:.2f}% per leg ({TAKER_FEE*2*100:.2f}% cycle)")
     log.info("=" * 55)
 
-    init_db()
+    # Fetch all pairs first
+    all_pairs = await fetch_all_pairs()
+    if not all_pairs:
+        log.error("No pairs fetched. Exiting.")
+        return
 
-    # Initialize official SDK connection
-    conn_ws = Connection(Configuration())
+    # Initialize SDK connection
+    conn = Connection(Configuration())
+    channel = SpotTickerChannel(conn, on_ticker)
+    channel.subscribe(all_pairs[:200])  # Max 200 pairs per subscription
 
-    # Subscribe to all spot tickers
-    channel = SpotTickerChannel(conn_ws, on_ticker)
-    channel.subscribe([])  # Empty array = all pairs
+    log.info(f"Subscribed to {min(len(all_pairs), 200)} pairs")
 
-    log.info("Subscribed to all Gate.io spot tickers via official SDK")
-
-    # Run WebSocket and scanner concurrently
+    # Run WebSocket and scanner
     await asyncio.gather(
-        conn_ws.run(),
+        conn.run(),
         scan_loop(init_db()),
     )
 
